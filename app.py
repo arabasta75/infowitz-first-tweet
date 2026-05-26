@@ -363,11 +363,19 @@ def _tw293_exhaust(q_with_ops: str, key: str, jid: str, max_pages: int = 30) -> 
     for page in range(max_pages):
         try:
             raw    = _tw293_search(q_with_ops, key, cursor=cursor)
-            tweets = _tw293_parse_tweets(raw)
-            cursor = _tw293_get_cursor(raw)
         except Exception as e:
-            _log_step(jid, f'  TW293 error page {page+1}: {e}')
+            _log_step(jid, f'  TW293 HTTP error page {page+1}: {e}')
             break
+
+        # Debug: log raw response structure on first page
+        if page == 0:
+            top_keys = list(raw.keys()) if isinstance(raw, dict) else f'type={type(raw).__name__}'
+            sample   = str(raw)[:300]
+            _log_step(jid, f'  TW293 raw keys: {top_keys}')
+            _log_step(jid, f'  TW293 raw sample: {sample}')
+
+        tweets = _tw293_parse_tweets(raw)
+        cursor = _tw293_get_cursor(raw)
 
         new = 0
         for t in tweets:
