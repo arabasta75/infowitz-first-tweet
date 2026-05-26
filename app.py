@@ -103,7 +103,7 @@ _gx_session = _requests.Session()
 _gx_session.verify = False
 
 def _getxapi_search(query: str, key: str, count: int = 5, cursor: str = None) -> dict:
-    params = {'q': query, 'product': 'latest', 'count': count}
+    params = {'q': query, 'product': 'Latest', 'count': count}
     if cursor:
         params['cursor'] = cursor
     r = _gx_session.get(
