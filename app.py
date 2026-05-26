@@ -297,11 +297,20 @@ def _log_step(jid: str, msg: str):
         _jobs[jid]['log'] = log[-50:]  # keep last 50 lines
 
 
-def _gx_has_results(query: str, key: str, since: datetime, until: datetime) -> bool:
+def _gx_has_results(query: str, key: str, since: datetime, until: datetime,
+                    jid: str = None) -> bool:
     q = f'{query} since:{_fmt_dt(since)} until:{_fmt_dt(until)}'
     try:
-        return len(_gx_parse_tweets(_getxapi_search(q, key, count=1))) > 0
+        raw    = _getxapi_search(q, key, count=1)
+        tweets = _gx_parse_tweets(raw)
+        if jid and not tweets:
+            top_keys = list(raw.keys()) if isinstance(raw, dict) else type(raw).__name__
+            sample   = str(raw)[:200]
+            _log_step(jid, f'  GX probe 0 results — keys:{top_keys} sample:{sample}')
+        return len(tweets) > 0
     except Exception as e:
+        if jid:
+            _log_step(jid, f'  GX probe error: {e}')
         logger.warning(f'GetXAPI probe error: {e}')
         return False
 
@@ -328,13 +337,14 @@ def _binary_search_epoch(query: str, gx_key: str, tw_key: str, jid: str,
     # Use whichever API is available — GetXAPI preferred (faster probes)
     def _has(since, until):
         if gx_key:
-            return _gx_has_results(query, gx_key, since, until)
+            return _gx_has_results(query, gx_key, since, until, jid=jid)
         return _tw293_has_results(query, tw_key, since, until)
 
     _log_step(jid, f'Binary search ({"GX" if gx_key else "TW293"}): [{_fmt_dt(low)} → {_fmt_dt(high)}]')
 
     # Quick sanity: does anything exist at all?
-    if not _has(low, high):
+    if not (gx_key and _gx_has_results(query, gx_key, low, high, jid=jid)
+            or tw_key and _tw293_has_results(query, tw_key, low, high)):
         _log_step(jid, '  No results in full range — query returns nothing')
         return None
 
