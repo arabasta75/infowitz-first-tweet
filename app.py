@@ -170,29 +170,57 @@ def _tw293_search(query: str, key: str, cursor: str = None,
     return r.json()
 
 def _tw293_parse_tweets(raw: dict) -> list:
-    if isinstance(raw.get('tweets'), list):
+    """Parse Twitter293 response — handles all known shapes via recursive extraction."""
+    # Shape 1: flat tweets list
+    if isinstance(raw.get('tweets'), list) and raw['tweets']:
         return raw['tweets']
-    if isinstance(raw.get('result'), list):
+    if isinstance(raw.get('result'), list) and raw['result']:
         return raw['result']
-    if isinstance(raw, list):
+    if isinstance(raw, list) and raw:
         return raw
-    # GraphQL shape
-    try:
-        instructions = (raw['data']['search_by_raw_query']['search_timeline']
-                        ['timeline']['instructions'])
-        out = []
-        for instr in instructions:
-            for entry in (instr.get('entries') or []):
-                content     = entry.get('content') or {}
-                item_c      = content.get('itemContent') or {}
-                tweet_res   = (item_c.get('tweet_results') or {}).get('result') or {}
-                legacy      = tweet_res.get('legacy') or {}
-                if legacy:
-                    out.append({'_legacy': legacy, '_result': tweet_res})
-        return out
-    except Exception:
-        pass
-    return []
+
+    # Universal: walk the whole response tree looking for tweet-shaped objects
+    found = []
+    seen_ids = set()
+
+    def _walk(node, depth=0):
+        if depth > 12 or not node:
+            return
+        if isinstance(node, list):
+            for item in node:
+                _walk(item, depth + 1)
+            return
+        if not isinstance(node, dict):
+            return
+
+        # Tweet shaped? needs id_str (or rest_id) + (full_text or text) + created_at
+        tid = node.get('id_str') or node.get('rest_id') or ''
+        has_text = bool(node.get('full_text') or node.get('text'))
+        has_date = bool(node.get('created_at'))
+        if tid and has_text and has_date:
+            if tid not in seen_ids:
+                seen_ids.add(tid)
+                found.append(node)
+            return  # don't recurse into a tweet we already captured
+
+        # tweet_results.result pattern (GraphQL)
+        tr = (node.get('tweet_results') or {}).get('result')
+        if isinstance(tr, dict):
+            _walk(tr, depth + 1)
+            return
+
+        # itemContent pattern
+        ic = node.get('itemContent')
+        if isinstance(ic, dict):
+            _walk(ic, depth + 1)
+
+        # Recurse into all dict values
+        for v in node.values():
+            if isinstance(v, (dict, list)):
+                _walk(v, depth + 1)
+
+    _walk(raw)
+    return found
 
 def _tw293_get_cursor(raw: dict) -> str | None:
     for k in ('next_cursor', 'cursor', 'nextCursor', 'bottom_cursor'):
@@ -219,6 +247,8 @@ def _tw293_tweet_dt(t: dict) -> datetime | None:
     return _parse_dt(t.get('created_at') or t.get('createdAt'))
 
 def _tw293_normalize(t: dict) -> dict:
+    """Normalize any tweet-shaped object — works on legacy, GraphQL result, or flat tweet."""
+    # Unwrap _legacy wrapper (old path)
     if '_legacy' in t:
         leg = t['_legacy']
         res = t.get('_result') or {}
@@ -228,29 +258,34 @@ def _tw293_normalize(t: dict) -> dict:
         username = udata.get('screen_name') or ''
         dt = _parse_dt(leg.get('created_at'))
         return {
-            'id':         tid,
-            'text':       (leg.get('full_text') or leg.get('text') or '').strip(),
-            'author':     username.lower(),
+            'id':          tid,
+            'text':        (leg.get('full_text') or leg.get('text') or '').strip(),
+            'author':      username.lower(),
             'author_name': udata.get('name') or username,
-            'created_at': dt.isoformat() if dt else '',
-            'url':        f'https://x.com/{username}/status/{tid}' if tid and username else '',
-            'likes':      leg.get('favorite_count', 0),
-            'retweets':   leg.get('retweet_count', 0),
-            'source':     'twitter293',
+            'created_at':  dt.isoformat() if dt else '',
+            'url':         f'https://x.com/{username}/status/{tid}' if tid and username else '',
+            'likes':       leg.get('favorite_count', 0),
+            'retweets':    leg.get('retweet_count', 0),
+            'source':      'twitter293',
         }
-    tid  = str(t.get('id') or t.get('id_str') or '')
-    dt   = _parse_dt(t.get('created_at') or t.get('createdAt'))
-    username = (t.get('user') or {}).get('screen_name') or t.get('username') or ''
+
+    # Walker-extracted flat tweet (has id_str + text + created_at directly)
+    tid      = str(t.get('id_str') or t.get('rest_id') or t.get('id') or '')
+    text     = (t.get('full_text') or t.get('text') or '').strip()
+    dt       = _parse_dt(t.get('created_at') or t.get('createdAt'))
+    user     = t.get('user') or {}
+    username = (user.get('screen_name') or t.get('username') or
+                t.get('screen_name') or '').lower().strip('@')
     return {
-        'id':         tid,
-        'text':       (t.get('text') or t.get('full_text') or '').strip(),
-        'author':     username.lower().strip('@'),
-        'author_name': (t.get('user') or {}).get('name') or username,
-        'created_at': dt.isoformat() if dt else '',
-        'url':        f'https://x.com/{username}/status/{tid}' if tid and username else '',
-        'likes':      t.get('favorite_count', 0) or t.get('likeCount', 0),
-        'retweets':   t.get('retweet_count', 0) or t.get('retweetCount', 0),
-        'source':     'twitter293',
+        'id':          tid,
+        'text':        text,
+        'author':      username,
+        'author_name': user.get('name') or t.get('name') or username,
+        'created_at':  dt.isoformat() if dt else '',
+        'url':         f'https://x.com/{username}/status/{tid}' if tid and username else '',
+        'likes':       t.get('favorite_count', 0) or t.get('likeCount', 0),
+        'retweets':    t.get('retweet_count', 0) or t.get('retweetCount', 0),
+        'source':      'twitter293',
     }
 
 # ── Core algorithm ─────────────────────────────────────────────────────────────
