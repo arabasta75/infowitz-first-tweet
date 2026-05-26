@@ -170,8 +170,7 @@ def _tw293_search(query: str, key: str, cursor: str = None,
     return r.json()
 
 def _tw293_parse_tweets(raw: dict) -> list:
-    """Parse Twitter293 response — handles all known shapes via recursive extraction."""
-    # Shape 1: flat tweets list
+    """Parse Twitter293 response — recursive walker capturing full GraphQL result nodes."""
     if isinstance(raw.get('tweets'), list) and raw['tweets']:
         return raw['tweets']
     if isinstance(raw.get('result'), list) and raw['result']:
@@ -179,12 +178,11 @@ def _tw293_parse_tweets(raw: dict) -> list:
     if isinstance(raw, list) and raw:
         return raw
 
-    # Universal: walk the whole response tree looking for tweet-shaped objects
-    found = []
+    found    = []
     seen_ids = set()
 
     def _walk(node, depth=0):
-        if depth > 12 or not node:
+        if depth > 14 or not node:
             return
         if isinstance(node, list):
             for item in node:
@@ -193,28 +191,26 @@ def _tw293_parse_tweets(raw: dict) -> list:
         if not isinstance(node, dict):
             return
 
-        # Tweet shaped? needs id_str (or rest_id) + (full_text or text) + created_at
-        tid = node.get('id_str') or node.get('rest_id') or ''
-        has_text = bool(node.get('full_text') or node.get('text'))
-        has_date = bool(node.get('created_at'))
-        if tid and has_text and has_date:
-            if tid not in seen_ids:
-                seen_ids.add(tid)
-                found.append(node)
-            return  # don't recurse into a tweet we already captured
-
-        # tweet_results.result pattern (GraphQL)
+        # Priority: capture the GraphQL result node (has legacy + core.user_results)
         tr = (node.get('tweet_results') or {}).get('result')
         if isinstance(tr, dict):
-            _walk(tr, depth + 1)
+            leg = tr.get('legacy') or {}
+            tid = str(tr.get('rest_id') or leg.get('id_str') or '')
+            if tid and (leg.get('full_text') or leg.get('text')) and leg.get('created_at'):
+                if tid not in seen_ids:
+                    seen_ids.add(tid)
+                    found.append({'_legacy': leg, '_result': tr})
+                return
+
+        # Fallback: flat tweet object (id_str + text + created_at at top level)
+        tid = str(node.get('id_str') or node.get('rest_id') or '')
+        has_text = bool(node.get('full_text') or node.get('text'))
+        has_date = bool(node.get('created_at'))
+        if tid and has_text and has_date and tid not in seen_ids:
+            seen_ids.add(tid)
+            found.append(node)
             return
 
-        # itemContent pattern
-        ic = node.get('itemContent')
-        if isinstance(ic, dict):
-            _walk(ic, depth + 1)
-
-        # Recurse into all dict values
         for v in node.values():
             if isinstance(v, (dict, list)):
                 _walk(v, depth + 1)
@@ -302,18 +298,26 @@ def _log_step(jid: str, msg: str):
 
 
 def _gx_has_results(query: str, key: str, since: datetime, until: datetime) -> bool:
-    """Returns True if GetXAPI finds at least one tweet in [since, until]."""
     q = f'{query} since:{_fmt_dt(since)} until:{_fmt_dt(until)}'
     try:
-        data   = _getxapi_search(q, key, count=1)
-        tweets = _gx_parse_tweets(data)
-        return len(tweets) > 0
+        return len(_gx_parse_tweets(_getxapi_search(q, key, count=1))) > 0
     except Exception as e:
         logger.warning(f'GetXAPI probe error: {e}')
         return False
 
 
-def _binary_search_epoch(query: str, key: str, jid: str,
+def _tw293_has_results(query: str, key: str, since: datetime, until: datetime) -> bool:
+    """Returns True if Twitter293 finds at least one tweet in [since, until]."""
+    q = f'{query} since:{_fmt_dt(since)} until:{_fmt_dt(until)}'
+    try:
+        raw = _tw293_search(q, key)
+        return len(_tw293_parse_tweets(raw)) > 0
+    except Exception as e:
+        logger.warning(f'TW293 probe error: {e}')
+        return False
+
+
+def _binary_search_epoch(query: str, gx_key: str, tw_key: str, jid: str,
                           low: datetime, high: datetime,
                           max_iters: int = 16) -> tuple[datetime, datetime] | None:
     """
@@ -321,8 +325,20 @@ def _binary_search_epoch(query: str, key: str, jid: str,
     Returns (window_start, window_end) of the earliest 6-month-ish window with results,
     or None if nothing found at all.
     """
-    _log_step(jid, f'Binary search: [{_fmt_dt(low)} → {_fmt_dt(high)}]')
-    earliest_window = None
+    # Use whichever API is available — GetXAPI preferred (faster probes)
+    def _has(since, until):
+        if gx_key:
+            return _gx_has_results(query, gx_key, since, until)
+        return _tw293_has_results(query, tw_key, since, until)
+
+    _log_step(jid, f'Binary search ({"GX" if gx_key else "TW293"}): [{_fmt_dt(low)} → {_fmt_dt(high)}]')
+
+    # Quick sanity: does anything exist at all?
+    if not _has(low, high):
+        _log_step(jid, '  No results in full range — query returns nothing')
+        return None
+
+    earliest_window = (low, high)
 
     for i in range(max_iters):
         mid = low + (high - low) / 2
@@ -330,17 +346,14 @@ def _binary_search_epoch(query: str, key: str, jid: str,
         _log_step(jid, f'  iter {i+1}: probe [{_fmt_dt(low)} → {_fmt_dt(mid)}] ({span_days}j)')
 
         if span_days < 1:
-            # Window is sub-day — stop binary search, zoom will handle it
-            if earliest_window is None:
-                earliest_window = (low, high)
+            earliest_window = (low, high)
             break
 
-        has = _gx_has_results(query, key, low, mid)
-        if has:
+        if _has(low, mid):
             earliest_window = (low, mid)
-            high = mid   # search even earlier
+            high = mid
         else:
-            low = mid    # nothing before mid, push lower bound up
+            low = mid
 
     return earliest_window
 
@@ -518,26 +531,17 @@ def _find_first_tweet(query: str, cfg: dict, jid: str,
     low  = since_dt or _TWITTER_BIRTH
     high = datetime.now(timezone.utc)
 
-    # ── Phase 1: binary search for earliest epoch ──────────────────────────────
-    if gx_key:
-        window = _binary_search_epoch(query, gx_key, jid, low, high)
-        if not window:
-            # Try broader: maybe results exist but binary search missed
-            _log_step(jid, 'Binary search no result — trying full range probe')
-            if _gx_has_results(query, gx_key, low, high):
-                window = (low, high)
-            else:
-                _job_set(jid, {'status': 'done', 'result': None,
-                               'msg': 'Aucun tweet trouvé pour cette requête.'})
-                return {}
-        win_start, win_end = window
-    else:
-        # No GetXAPI — use Twitter293 directly on full range (less optimal)
-        win_start, win_end = low, high
+    # ── Phase 1: binary search (GetXAPI preferred, TW293 fallback) ───────────────
+    window = _binary_search_epoch(query, gx_key, tw_key, jid, low, high)
+    if not window:
+        _job_set(jid, {'status': 'done', 'result': None,
+                       'msg': 'Aucun tweet trouvé pour cette requête.'})
+        return {}
+    win_start, win_end = window
 
     _job_set(jid, {'phase': 'zoom', 'window': f'{_fmt_dt(win_start)} → {_fmt_dt(win_end)}'})
 
-    # ── Phase 2: zoom to micro-window ──────────────────────────────────────────
+    # ── Phase 2: zoom to micro-window (GetXAPI only — TW293 too slow for probes) ─
     if gx_key:
         win_start, win_end = _zoom_to_micro_window(query, gx_key, jid, win_start, win_end)
 
