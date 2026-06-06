@@ -1,5 +1,5 @@
 """
-Adam_X — Find the first tweet on any topic, or the first tweet of any account.
+Infowitz First Tweet — Find the first tweet on any topic, or the first tweet of any account.
 APIs: GetXAPI + Twitter293 (RapidAPI)
 Strategy: binary search in time → progressive zoom → exhaust micro-window
 """
@@ -712,7 +712,7 @@ _LOGIN_HTML = '''<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Adam_X — Login</title>
+<title>Infowitz First Tweet — Login</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#0a0a0f;color:#e2e8f0;font-family:'Inter',system-ui,sans-serif;
@@ -732,7 +732,7 @@ button:hover{background:#4f46e5}
 </head>
 <body>
 <div class="card">
-  <h1>Adam_X</h1>
+  <h1>Infowitz First Tweet</h1>
   <p class="sub">First tweet finder</p>
   <label>Mot de passe</label>
   <input type="password" id="pw" placeholder="••••••••" onkeydown="if(event.key==='Enter')login()">
@@ -754,7 +754,7 @@ _APP_HTML = '''<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Adam_X — First Tweet Finder</title>
+<title>Infowitz First Tweet</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#0a0a0f;color:#e2e8f0;font-family:'Inter',system-ui,sans-serif;min-height:100vh}
@@ -1086,5 +1086,5 @@ loadHistory();
 # ── Entrypoint ─────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5010))
-    logger.info(f'Adam_X starting on port {port}')
+    logger.info(f'Infowitz First Tweet starting on port {port}')
     app.run(host='0.0.0.0', port=port, debug=False)
