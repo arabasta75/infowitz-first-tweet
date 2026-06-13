@@ -20,7 +20,23 @@ app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', os.urandom(32))
 Compress(app)
 
-DATA_DIR   = 'data'
+_IS_HTTPS_AX = bool(os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('HTTPS') or os.environ.get('FORCE_HTTPS'))
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = _IS_HTTPS_AX
+
+
+@app.after_request
+def _security_headers(resp):
+    resp.headers['X-Content-Type-Options'] = 'nosniff'
+    resp.headers['X-Frame-Options'] = 'SAMEORIGIN'
+    resp.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    resp.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
+    if _IS_HTTPS_AX:
+        resp.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    return resp
+
+DATA_DIR   = os.environ.get('DATA_DIR') or os.environ.get('RAILWAY_VOLUME_MOUNT_PATH') or 'data'
 USERS_DIR  = os.path.join(DATA_DIR, 'users')
 os.makedirs(USERS_DIR, exist_ok=True)
 
@@ -89,6 +105,138 @@ def _load_cfg():
     cfg.setdefault('getxapi_key',  os.environ.get('GETXAPI_KEY', ''))
     cfg.setdefault('twitter293_key', os.environ.get('TWITTER293_KEY', ''))
     return cfg
+
+# ── Funnel prospect (édition demo) ───────────────────────────────────────────
+# Édition : 'internal' (équipe, illimité) ou 'demo' (public, lead-gate + quota).
+EDITION = (os.environ.get('EDITION', 'demo') or 'demo').strip().lower()
+IS_DEMO = EDITION != 'internal'
+_LEAD_FREE_QUOTA = int(os.environ.get('LEAD_FREE_QUOTA', '1'))
+_DEV_AUTH_BYPASS = os.environ.get('DEV_AUTH_BYPASS', '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+_LEADS_FILE    = os.path.join(DATA_DIR, 'leads.json')
+_SEARCHES_FILE = os.path.join(DATA_DIR, 'searches.json')
+_LEADS_LOCK    = threading.Lock()
+
+def _leads_all() -> list:
+    return _load_json(_LEADS_FILE, {'leads': []}).get('leads', [])
+
+def lead_register(email, first_name, last_name, company, ip=''):
+    email = (email or '').lower().strip()
+    with _LEADS_LOCK:
+        leads = _leads_all()
+        for l in leads:
+            if l['email'] == email:
+                return {'token': l['id'], 'uses': l['uses'], 'is_new': False}
+        token = uuid.uuid4().hex
+        leads.append({'id': token, 'email': email, 'first_name': first_name.strip(),
+                      'last_name': last_name.strip(), 'company': company.strip(),
+                      'created_at': datetime.now(timezone.utc).isoformat(), 'ip': ip, 'uses': 0})
+        _save_json(_LEADS_FILE, {'leads': leads})
+        return {'token': token, 'uses': 0, 'is_new': True}
+
+def lead_get(token):
+    return next((l for l in _leads_all() if l['id'] == token), None)
+
+def lead_increment_uses(token):
+    with _LEADS_LOCK:
+        leads = _leads_all()
+        for l in leads:
+            if l['id'] == token:
+                l['uses'] = l.get('uses', 0) + 1
+                _save_json(_LEADS_FILE, {'leads': leads})
+                return l['uses']
+    return 0
+
+def leads_delete(token):
+    with _LEADS_LOCK:
+        leads = _leads_all()
+        n = len(leads)
+        leads = [l for l in leads if l['id'] != token]
+        _save_json(_LEADS_FILE, {'leads': leads})
+        return len(leads) < n
+
+def sh_insert(user_id, keyword, mode, result_count=0):
+    """Persiste une recherche (historique prospect)."""
+    with _LEADS_LOCK:
+        data = _load_json(_SEARCHES_FILE, {'searches': []})
+        data.setdefault('searches', []).append({
+            'user_id': user_id or 'anon', 'keyword': keyword, 'mode': mode,
+            'ts': datetime.now(timezone.utc).isoformat(), 'result_count': result_count,
+        })
+        _save_json(_SEARCHES_FILE, data)
+
+def leads_activity(searches_per_lead=50):
+    leads = sorted(_leads_all(), key=lambda l: l.get('created_at', ''), reverse=True)
+    by_id = {l['id']: {**l, 'searches': []} for l in leads}
+    anon = {'id': 'anon', 'email': '—', 'first_name': '(anonyme', 'last_name': 'avant rattachement)',
+            'company': '—', 'created_at': '', 'ip': '', 'uses': 0, 'searches': []}
+    rows = sorted(_load_json(_SEARCHES_FILE, {'searches': []}).get('searches', []),
+                  key=lambda s: s.get('ts', ''), reverse=True)
+    for s in rows:
+        bucket = by_id.get(s.get('user_id'))
+        if bucket is None:
+            if s.get('user_id') == 'anon':
+                bucket = anon
+            else:
+                continue
+        if len(bucket['searches']) < searches_per_lead:
+            bucket['searches'].append({'keyword': s.get('keyword', ''), 'mode': s.get('mode', ''),
+                                       'ts': s.get('ts', ''), 'article_count': s.get('result_count', 0)})
+    out = list(by_id.values())
+    if anon['searches']:
+        out.append(anon)
+    return out
+
+def _is_localhost():
+    if not _DEV_AUTH_BYPASS:
+        return False
+    return (request.remote_addr or '') in ('127.0.0.1', '::1', 'localhost')
+
+def _resolve_lead_token():
+    token = (request.headers.get('X-Lead-Token') or '').strip()
+    if not token:
+        return None, None
+    lead = lead_get(token)
+    return (lead, token) if lead else (None, None)
+
+def _attrib_uid():
+    """uid pour attribuer une recherche : admin connecté, sinon lead token, sinon 'anon'."""
+    if session.get('authed') or _is_localhost():
+        return 'admin'
+    return getattr(request, 'lead_token', None) or 'anon'
+
+def require_auth_or_token(f):
+    """Session admin (illimité) OU lead token avec quota (édition demo)."""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if session.get('authed') or _is_localhost():
+            return f(*args, **kwargs)
+        if not IS_DEMO:
+            return jsonify({'error': 'Non authentifié', 'code': 'AUTH_REQUIRED'}), 401
+        lead, token = _resolve_lead_token()
+        if not token:
+            return jsonify({'error': 'Non authentifié', 'code': 'AUTH_REQUIRED'}), 401
+        if lead['uses'] >= _LEAD_FREE_QUOTA:
+            return jsonify({'error': 'quota_exceeded', 'code': 'QUOTA_EXCEEDED',
+                            'message': 'Votre recherche gratuite a déjà été utilisée.'}), 429
+        request.lead_token = token
+        return f(*args, **kwargs)
+    return wrapper
+
+def require_auth_or_token_readonly(f):
+    """Comme require_auth_or_token mais SANS consommer le quota (polling/lecture)."""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if session.get('authed') or _is_localhost():
+            return f(*args, **kwargs)
+        if not IS_DEMO:
+            return jsonify({'error': 'Non authentifié', 'code': 'AUTH_REQUIRED'}), 401
+        lead, token = _resolve_lead_token()
+        if not token:
+            return jsonify({'error': 'Non authentifié', 'code': 'AUTH_REQUIRED'}), 401
+        request.lead_token = token
+        return f(*args, **kwargs)
+    return wrapper
 
 # ── Jobs store ─────────────────────────────────────────────────────────────────
 _jobs: dict = {}
@@ -598,7 +746,7 @@ def _find_first_account_tweet(username: str, cfg: dict, jid: str) -> dict:
 
 # ── Background worker ──────────────────────────────────────────────────────────
 def _run_job(jid: str, mode: str, query: str, username: str,
-              cfg: dict, since_dt: datetime | None):
+              cfg: dict, since_dt: datetime | None, owner_uid: str = 'anon'):
     try:
         _job_set(jid, {'status': 'running', 'phase': 'search', 'log': []})
 
@@ -611,6 +759,12 @@ def _run_job(jid: str, mode: str, query: str, username: str,
             _job_set(jid, {'status': 'done', 'phase': 'done', 'result': result})
         else:
             _job_set(jid, {'status': 'done', 'phase': 'done', 'result': None})
+        # Historique prospect (attribution)
+        try:
+            sh_insert(owner_uid, keyword=(username if mode == 'account' else query),
+                      mode=mode, result_count=(1 if result else 0))
+        except Exception as _e:
+            logger.warning(f'sh_insert error: {_e}')
     except Exception as e:
         logger.exception(f'Job {jid} crashed: {e}')
         _job_set(jid, {'status': 'error', 'error': str(e)})
@@ -619,9 +773,12 @@ def _run_job(jid: str, mode: str, query: str, username: str,
 # ── Routes ─────────────────────────────────────────────────────────────────────
 @app.route('/')
 def index():
-    if not session.get('authed'):
+    is_admin = bool(session.get('authed')) or _is_localhost()
+    # Édition interne non-authentifiée → écran de login équipe.
+    if not is_admin and not IS_DEMO:
         return render_template_string(_LOGIN_HTML)
-    return render_template_string(_APP_HTML)
+    # Demo (ou admin) → l'app ; le JS bascule lead-gate vs token vs admin.
+    return render_template_string(_APP_HTML, is_demo=IS_DEMO, is_admin=is_admin)
 
 @app.route('/api/auth/login', methods=['POST'])
 def api_login():
@@ -638,6 +795,59 @@ def api_logout():
     session.clear()
     return jsonify({'ok': True})
 
+# ── Leads (funnel demo) ──────────────────────────────────────────────────────
+import re as _re_leads
+
+@app.route('/api/leads/register', methods=['POST'])
+def api_leads_register():
+    if not IS_DEMO:
+        return jsonify({'error': 'Indisponible'}), 404
+    body = request.get_json(silent=True) or {}
+    email = str(body.get('email', '')).strip()
+    first = str(body.get('first_name', '')).strip()
+    last  = str(body.get('last_name', '')).strip()
+    company = str(body.get('company', '')).strip()
+    if not first or not last:
+        return jsonify({'error': 'Prénom et nom requis'}), 400
+    if not _re_leads.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
+        return jsonify({'error': 'Email invalide'}), 400
+    if not company:
+        return jsonify({'error': 'Entreprise requise'}), 400
+    res = lead_register(email, first, last, company, ip=(request.remote_addr or ''))
+    return jsonify({'token': res['token'], 'uses': res['uses'], 'quota': _LEAD_FREE_QUOTA})
+
+@app.route('/api/leads', methods=['GET'])
+@_require_auth
+def api_leads_list():
+    leads = _leads_all()
+    return jsonify({'leads': leads, 'total': len(leads)})
+
+@app.route('/api/leads/activity', methods=['GET'])
+@_require_auth
+def api_leads_activity():
+    leads = leads_activity()
+    total_searches = sum(len(l.get('searches') or []) for l in leads)
+    return jsonify({'leads': leads, 'total': len(leads), 'total_searches': total_searches})
+
+@app.route('/api/leads/export.csv', methods=['GET'])
+@_require_auth
+def api_leads_export():
+    import csv, io
+    from flask import Response
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(['email', 'prenom', 'nom', 'entreprise', 'date_inscription', 'recherches', 'ip'])
+    for l in _leads_all():
+        w.writerow([l['email'], l['first_name'], l['last_name'], l['company'],
+                    l['created_at'], l['uses'], l.get('ip', '')])
+    return Response(('﻿' + out.getvalue()).encode('utf-8'), mimetype='text/csv; charset=utf-8',
+                    headers={'Content-Disposition': 'attachment; filename="leads.csv"'})
+
+@app.route('/api/leads/<token>', methods=['DELETE'])
+@_require_auth
+def api_leads_delete(token):
+    return jsonify({'ok': leads_delete(token)})
+
 @app.route('/api/config', methods=['GET', 'POST'])
 @_require_auth
 def api_config():
@@ -652,7 +862,7 @@ def api_config():
     return jsonify({'ok': True})
 
 @app.route('/api/adam/search', methods=['POST'])
-@_require_auth
+@require_auth_or_token
 def api_search():
     body     = request.get_json(silent=True) or {}
     mode     = body.get('mode', 'topic')   # 'topic' | 'account'
@@ -676,20 +886,25 @@ def api_search():
     if not cfg.get('getxapi_key') and not cfg.get('twitter293_key'):
         return jsonify({'error': 'Aucune clé API configurée — va dans Paramètres'}), 400
 
+    # Consomme le quota lead + attribution (capturé hors thread)
+    _owner = _attrib_uid()
+    if getattr(request, 'lead_token', None):
+        lead_increment_uses(request.lead_token)
+
     jid = uuid.uuid4().hex[:12]
     _job_set(jid, {'status': 'queued', 'mode': mode, 'query': query,
                    'username': username, 'ts': time.time()})
 
     t = threading.Thread(
         target=_run_job,
-        args=(jid, mode, query, username, cfg, since_dt),
+        args=(jid, mode, query, username, cfg, since_dt, _owner),
         daemon=True,
     )
     t.start()
     return jsonify({'job_id': jid})
 
 @app.route('/api/adam/status/<jid>', methods=['GET'])
-@_require_auth
+@require_auth_or_token_readonly
 def api_status(jid: str):
     with _jobs_lock:
         job = _jobs.get(jid)
@@ -830,10 +1045,47 @@ input:focus,select:focus{border-color:#6366f1}
 </style>
 </head>
 <body>
+<!-- Lead gate (prospect, édition demo) -->
+<div id="leadGate" style="display:none;position:fixed;inset:0;z-index:9999;background:linear-gradient(135deg,#060810,#0a0e1a 60%,#0f1628);align-items:center;justify-content:center;padding:20px">
+  <div style="width:380px;max-width:95vw;background:#12121a;border:1px solid #1e1e2e;border-radius:14px;padding:28px">
+    <div style="font-size:19px;font-weight:700;color:#fff;margin-bottom:4px">Adam<span style="color:#6366f1">_X</span> — accès gratuit</div>
+    <div style="font-size:12px;color:#64748b;margin-bottom:18px">Trouvez le premier tweet sur n'importe quel sujet. Une recherche offerte.</div>
+    <div id="lgErr" style="display:none;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#f87171;font-size:12px;padding:8px 10px;border-radius:6px;margin-bottom:12px"></div>
+    <div class="row"><div><label style="margin-top:0">Prénom</label><input id="lg-firstname" type="text"></div><div><label style="margin-top:0">Nom</label><input id="lg-lastname" type="text"></div></div>
+    <label>Email professionnel</label><input id="lg-email" type="email" placeholder="jean.dupont@entreprise.com" onkeydown="if(event.key==='Enter')submitLeadGate()">
+    <label>Entreprise</label><input id="lg-company" type="text" placeholder="Votre organisation" onkeydown="if(event.key==='Enter')submitLeadGate()">
+    <button id="lg-btn" class="go-btn" onclick="submitLeadGate()">Accéder à l'outil gratuitement →</button>
+    <div style="text-align:center;margin-top:12px"><a href="#" onclick="_adminLoginPrompt();return false" style="font-size:11px;color:#64748b;text-decoration:none">Accès équipe →</a></div>
+  </div>
+</div>
+<!-- Quota épuisé -->
+<div id="quotaCta" style="display:none;position:fixed;inset:0;z-index:9998;background:rgba(6,8,16,.92);align-items:center;justify-content:center;backdrop-filter:blur(6px)">
+  <div style="width:380px;max-width:95vw;background:#12121a;border:1px solid #1e1e2e;border-radius:14px;padding:28px;text-align:center">
+    <div style="font-size:17px;font-weight:700;color:#fff;margin-bottom:8px">Recherche gratuite utilisée</div>
+    <div style="font-size:13px;color:#94a3b8;margin-bottom:18px">Pour des recherches illimitées, contactez l'équipe Infowitz.</div>
+    <a class="go-btn" style="display:block;text-decoration:none;text-align:center" href="mailto:contact@infowitz.com">Demander un accès complet</a>
+    <button class="btn-sm btn-ghost" style="margin-top:10px" onclick="document.getElementById('quotaCta').style.display='none'">Fermer</button>
+  </div>
+</div>
+<!-- Prospects (admin) -->
+<div id="prospectsModal" style="display:none;position:fixed;inset:0;z-index:9997;background:rgba(6,8,16,.85);align-items:flex-start;justify-content:center;padding:40px 20px;overflow:auto">
+  <div style="width:760px;max-width:96vw;background:#12121a;border:1px solid #1e1e2e;border-radius:14px;padding:24px">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap">
+      <div style="font-size:16px;font-weight:700;color:#fff">👤 Prospects</div>
+      <input id="prospects-search" placeholder="Filtrer…" style="width:200px;padding:6px 10px;font-size:12px" oninput="renderProspects()">
+      <button class="btn-sm btn-ghost" onclick="loadProspects()">↻</button>
+      <a class="btn-sm btn-ghost" style="text-decoration:none" href="/api/leads/export.csv">⬇ CSV</a>
+      <span style="font-size:12px;color:#64748b;margin-left:auto">Prospects : <b id="prospects-total" style="color:#e2e8f0">—</b> · Recherches : <b id="prospects-searches-total" style="color:#e2e8f0">—</b></span>
+      <button class="btn-sm btn-ghost" onclick="document.getElementById('prospectsModal').style.display='none'">✕</button>
+    </div>
+    <div id="prospects-body"></div>
+  </div>
+</div>
 <div class="header">
   <div class="logo">Adam<span>_X</span></div>
   <div class="nav-right">
-    <button class="btn-sm btn-ghost" onclick="toggleConfig()">⚙ API Keys</button>
+    <button class="btn-sm btn-ghost" id="prospectsBtn" style="display:none" onclick="loadProspects()">👤 Prospects</button>
+    <button class="btn-sm btn-ghost" id="configBtn" onclick="toggleConfig()">⚙ API Keys</button>
     <button class="btn-sm btn-ghost" onclick="logout()">Déconnexion</button>
   </div>
 </div>
@@ -901,6 +1153,27 @@ input:focus,select:focus{border-color:#6366f1}
 </div>
 
 <script>
+window.IS_DEMO  = {{ 'true' if is_demo else 'false' }};
+window._isAdmin = {{ 'true' if is_admin else 'false' }};
+// Intercepteur fetch : injecte X-Lead-Token sur les appels /api + gère le quota (429)
+const _origFetch = window.fetch.bind(window);
+window.fetch = function(url, opts={}) {
+  try {
+    if (typeof url === 'string' && url.startsWith('/api')) {
+      const lt = localStorage.getItem('adamx-lead-token');
+      if (lt) { opts.headers = Object.assign({}, opts.headers || {}, {'X-Lead-Token': lt}); }
+    }
+  } catch(e) {}
+  return _origFetch(url, opts).then(async r => {
+    if (r.status === 429) { try { const d = await r.clone().json(); if (d.code === 'QUOTA_EXCEEDED') _showQuotaCta(); } catch(e){} }
+    return r;
+  });
+};
+function _showQuotaCta() {
+  const el = document.getElementById('quotaCta');
+  if (el) el.style.display = 'flex';
+}
+
 let mode = 'topic';
 let pollTimer = null;
 
@@ -1075,9 +1348,94 @@ function replayResult(i) {
 }
 
 async function logout() {
+  if (!window._isAdmin && localStorage.getItem('adamx-lead-token')) {
+    localStorage.removeItem('adamx-lead-token'); localStorage.removeItem('adamx-lead-name');
+    location.reload(); return;
+  }
   await fetch('/api/auth/logout',{method:'POST'});
   location.reload();
 }
+
+// ── Lead gate (prospect) ──────────────────────────────────────────────────
+async function submitLeadGate() {
+  const err = document.getElementById('lgErr');
+  const fn = document.getElementById('lg-firstname').value.trim();
+  const ln = document.getElementById('lg-lastname').value.trim();
+  const em = document.getElementById('lg-email').value.trim();
+  const co = document.getElementById('lg-company').value.trim();
+  err.style.display = 'none';
+  if (!fn || !ln) { err.textContent = 'Prénom et nom requis'; err.style.display = 'block'; return; }
+  if (!em.includes('@')) { err.textContent = 'Email invalide'; err.style.display = 'block'; return; }
+  if (!co) { err.textContent = 'Entreprise requise'; err.style.display = 'block'; return; }
+  const btn = document.getElementById('lg-btn'); btn.disabled = true; btn.textContent = 'Enregistrement…';
+  try {
+    const r = await _origFetch('/api/leads/register', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({email:em, first_name:fn, last_name:ln, company:co})});
+    const d = await r.json();
+    if (!r.ok || d.error) { err.textContent = d.error || 'Erreur'; err.style.display = 'block'; btn.disabled = false; btn.textContent = "Accéder à l'outil gratuitement →"; return; }
+    localStorage.setItem('adamx-lead-token', d.token);
+    localStorage.setItem('adamx-lead-name', fn + ' ' + ln);
+    document.getElementById('leadGate').style.display = 'none';
+  } catch(e) { err.textContent = 'Erreur réseau'; err.style.display = 'block'; btn.disabled = false; btn.textContent = "Accéder à l'outil gratuitement →"; }
+}
+
+async function _adminLoginPrompt() {
+  const pw = prompt('Mot de passe équipe :');
+  if (!pw) return;
+  const r = await _origFetch('/api/auth/login', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({password: pw})});
+  if (r.ok) location.reload(); else alert('Mot de passe incorrect');
+}
+
+// ── Prospects (admin) ──────────────────────────────────────────────────────
+let _prospectsData = [];
+function _escP(s){const d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML;}
+function _fmtP(ts){if(!ts)return'—';const d=new Date(ts);return isNaN(d)?ts:d.toLocaleString('fr-FR',{day:'2-digit',month:'2-digit',year:'2-digit',hour:'2-digit',minute:'2-digit'});}
+async function loadProspects() {
+  document.getElementById('prospectsModal').style.display = 'flex';
+  const body = document.getElementById('prospects-body');
+  body.innerHTML = '<div style="color:#64748b;font-size:12px;padding:16px">Chargement…</div>';
+  try {
+    const r = await _origFetch('/api/leads/activity', {credentials:'include'});
+    const d = await r.json();
+    if (d.error) { body.innerHTML = '<div style="color:#f87171;font-size:12px;padding:16px">'+d.error+'</div>'; return; }
+    _prospectsData = d.leads || [];
+    document.getElementById('prospects-total').textContent = d.total ?? _prospectsData.length;
+    document.getElementById('prospects-searches-total').textContent = d.total_searches ?? 0;
+    renderProspects();
+  } catch(e) { body.innerHTML = '<div style="color:#f87171;font-size:12px;padding:16px">Erreur réseau</div>'; }
+}
+function renderProspects() {
+  const body = document.getElementById('prospects-body');
+  const q = (document.getElementById('prospects-search').value || '').toLowerCase().trim();
+  let leads = _prospectsData;
+  if (q) leads = leads.filter(l => (l.first_name+' '+l.last_name+' '+l.email+' '+l.company+' '+(l.searches||[]).map(s=>s.keyword).join(' ')).toLowerCase().includes(q));
+  if (!leads.length) { body.innerHTML = '<div style="color:#64748b;font-size:12px;padding:16px">Aucun prospect.</div>'; return; }
+  body.innerHTML = leads.map(l => {
+    const s = l.searches || [];
+    const isAnon = l.id === 'anon';
+    const rows = s.length ? s.map(x => `<tr><td style="padding:4px 10px;color:#64748b;white-space:nowrap">${_fmtP(x.ts)}</td><td style="padding:4px 10px"><span style="font-family:monospace;color:#e2e8f0">${_escP(x.keyword)}</span></td><td style="padding:4px 10px;color:#64748b">${_escP(x.mode)}</td><td style="padding:4px 10px;color:${x.article_count?'#4ade80':'#64748b'};text-align:right">${x.article_count?'✓ trouvé':'∅'}</td></tr>`).join('') : '<tr><td colspan="4" style="padding:6px 10px;color:#64748b;font-style:italic">Inscrit, aucune recherche</td></tr>';
+    return `<div style="margin-bottom:12px;border:1px solid #1e1e2e;border-radius:10px;overflow:hidden">
+      <div style="display:flex;align-items:center;gap:12px;padding:10px 14px;background:#0d0d14;border-bottom:1px solid #1e1e2e">
+        <div style="flex:1"><div style="font-weight:700;font-size:13px;color:#e2e8f0">${_escP(l.first_name)} ${_escP(l.last_name)}${isAnon?'':` · <span style="font-weight:400;color:#64748b">${_escP(l.company)}</span>`}</div>
+        <div style="font-size:11px;color:#64748b">${isAnon?'recherches avant rattachement':`${_escP(l.email)} · ${_fmtP(l.created_at)}${l.ip?' · '+_escP(l.ip):''}`}</div></div>
+        <div style="text-align:right;font-size:11px;color:#64748b"><b style="color:#e2e8f0;font-size:15px">${s.length}</b><br>rech.</div></div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px">${rows}</table></div>`;
+  }).join('');
+}
+
+// ── Boot funnel ────────────────────────────────────────────────────────────
+(function _bootFunnel() {
+  if (window._isAdmin) {
+    const pb = document.getElementById('prospectsBtn'); if (pb) pb.style.display = '';
+    return;  // admin : app complète
+  }
+  if (window.IS_DEMO) {
+    const cb = document.getElementById('configBtn'); if (cb) cb.style.display = 'none';  // pas de clés API pour le prospect
+    if (!localStorage.getItem('adamx-lead-token')) {
+      document.getElementById('leadGate').style.display = 'flex';  // pas de token → capture
+    }
+  }
+})();
 
 loadHistory();
 </script>
